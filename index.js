@@ -3,13 +3,14 @@ const { Client, GatewayIntentBits, Partials } = require('discord.js');
 const express = require('express');
 
 // ---------- CLIENTE DO DISCORD ----------
+const { Client, GatewayIntentBits } = require('discord.js');
+
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent, // necessário para ler o texto das mensagens (!ping)
-  ],
-  partials: [Partials.Channel],
+    GatewayIntentBits.MessageContent
+  ]
 });
 
 client.once('ready', () => {
