@@ -3,8 +3,6 @@ const { Client, GatewayIntentBits, Partials } = require('discord.js');
 const express = require('express');
 
 // ---------- CLIENTE DO DISCORD ----------
-const { Client, GatewayIntentBits } = require('discord.js');
-
 const client = new Client({
   intents: [
     GatewayIntentBits.Guilds,
@@ -32,7 +30,7 @@ client.on('error', (err) => {
 
 client.login(process.env.TOKEN);
 
-// ---------- SERVIDOR HTTP (necessário para o Render reconhecer o serviço como "Web Service") ----------
+// ---------- SERVIDOR HTTP (Render) ----------
 const app = express();
 const PORT = process.env.PORT || 3000;
 
