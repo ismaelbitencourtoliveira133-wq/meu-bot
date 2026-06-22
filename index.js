@@ -1,4 +1,3 @@
-
 require('dotenv').config();
 const {
   Client,
@@ -64,6 +63,15 @@ const commands = [
     .setName('painel-tickets')
     .setDescription('Envia o painel de abertura de tickets neste canal.')
     .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
+  new SlashCommandBuilder()
+    .setName('spoiler')
+    .setDescription('Envia uma mensagem estilizada no canal.')
+    .addStringOption((opt) =>
+      opt
+        .setName('mensagem')
+        .setDescription('Texto que vai aparecer na mensagem.')
+        .setRequired(true)
+    ),
 ].map((c) => c.toJSON());
 
 client.once('ready', async () => {
@@ -131,6 +139,28 @@ client.on('interactionCreate', async (interaction) => {
 
     await interaction.channel.send({ embeds: [embed], components: [row] });
     await interaction.reply({ content: '✅ Painel enviado!', ephemeral: true });
+    return;
+  }
+
+  // ---------- COMANDO: /spoiler ----------
+  if (interaction.isChatInputCommand() && interaction.commandName === 'spoiler') {
+    if (!process.env.OWNER_ID || interaction.user.id !== process.env.OWNER_ID) {
+      return interaction.reply({
+        content: '❌ Você não tem permissão para usar este comando.',
+        ephemeral: true,
+      });
+    }
+
+    const texto = interaction.options.getString('mensagem', true);
+
+    const spoilerEmbed = new EmbedBuilder()
+      .setColor(0x2c2f33)
+      .setDescription(`||${texto}||`)
+      .setFooter({ text: '👁️ Clique para revelar' })
+      .setTimestamp();
+
+    await interaction.channel.send({ embeds: [spoilerEmbed] });
+    await interaction.reply({ content: '✅ Mensagem enviada!', ephemeral: true });
     return;
   }
 
