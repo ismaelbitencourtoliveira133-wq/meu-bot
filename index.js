@@ -24,6 +24,7 @@ const INVITE_LOG_CHANNEL_ID = '1518234479494299779';
 const TICKET_PANEL_CHANNEL_ID = '1518234573203312700'; // canal onde fica a mensagem/painel para abrir ticket
 const CATEGORY_ID = '1518361267071615148'; // categoria onde os canais de ticket serão criados
 const STAFF_ROLE_ID = '1518234150627315762'; // cargo que será marcado e que tem acesso aos tickets
+const SPOILER_ROLE_ID = '1518234095518482573'; // cargo autorizado a usar o /spoiler
 
 // ---------- CONFIGURAÇÃO DOS TIPOS DE TICKET ----------
 const TICKET_TYPES = {
@@ -389,7 +390,7 @@ client.on('interactionCreate', async (interaction) => {
 
   // ---------- COMANDO: /spoiler ----------
   if (interaction.isChatInputCommand() && interaction.commandName === 'spoiler') {
-    if (!process.env.OWNER_ID || interaction.user.id !== process.env.OWNER_ID) {
+    if (!interaction.member.roles.cache.has(SPOILER_ROLE_ID)) {
       return interaction.reply({
         content: '❌ Você não tem permissão para usar este comando.',
         ephemeral: true,
