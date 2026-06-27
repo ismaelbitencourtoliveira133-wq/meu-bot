@@ -1,4 +1,6 @@
 require('dotenv').config();
+const fs = require('fs');
+const path = require('path');
 const {
   Client,
   GatewayIntentBits,
@@ -14,6 +16,9 @@ const {
   ChannelType,
 } = require('discord.js');
 const express = require('express');
+
+// ---------- CANAL DE LOG DE CONVITES ----------
+const INVITE_LOG_CHANNEL_ID = '1518234479494299779';
 
 // ---------- CONFIGURAÇÃO DOS TIPOS DE TICKET ----------
 const TICKET_TYPES = {
@@ -53,9 +58,95 @@ const client = new Client({
     GatewayIntentBits.Guilds,
     GatewayIntentBits.GuildMessages,
     GatewayIntentBits.MessageContent, // necessário para o !ping
+    GatewayIntentBits.GuildMembers,   // necessário para detectar entradas (PRECISA ser ativado no Developer Portal)
+    GatewayIntentBits.GuildInvites,   // necessário para rastrear convites
   ],
   partials: [Partials.Channel],
 });
+
+// =====================================================
+// ---------- SISTEMA DE RASTREAMENTO DE CONVITES ----------
+// =====================================================
+
+// Cache em memória: guildId -> Map(code -> { uses, maxUses, inviterId, inviterTag })
+const inviteCache = new Map();
+// Cache de uses do vanity URL (link personalizado) por servidor
+const vanityCache = new Map();
+
+// ---------- PERSISTÊNCIA EM DISCO ----------
+const DATA_DIR = path.join(__dirname, 'data');
+const DATA_FILE = path.join(DATA_DIR, 'invites.json');
+
+function loadInviteData() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (!fs.existsSync(DATA_FILE)) return {};
+    const raw = fs.readFileSync(DATA_FILE, 'utf8');
+    return raw ? JSON.parse(raw) : {};
+  } catch (err) {
+    console.error('Erro ao carregar dados de convites:', err.message);
+    return {};
+  }
+}
+
+function saveInviteData() {
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(DATA_FILE, JSON.stringify(inviteData, null, 2));
+  } catch (err) {
+    console.error('Erro ao salvar dados de convites:', err.message);
+  }
+}
+
+let inviteData = loadInviteData(); // { [guildId]: { counts: { [userId]: number }, members: { [memberId]: { inviterId, code, joinedAt } } } }
+
+function ensureGuildData(guildId) {
+  if (!inviteData[guildId]) {
+    inviteData[guildId] = { counts: {}, members: {} };
+  }
+  return inviteData[guildId];
+}
+
+function registerInvite(guildId, inviterId, memberId, code) {
+  const gData = ensureGuildData(guildId);
+  if (inviterId) {
+    gData.counts[inviterId] = (gData.counts[inviterId] || 0) + 1;
+  }
+  gData.members[memberId] = {
+    inviterId: inviterId || null,
+    code: code || null,
+    joinedAt: Date.now(),
+  };
+  saveInviteData();
+}
+
+// ---------- CACHE DE CONVITES DE UM SERVIDOR ----------
+async function cacheGuildInvites(guild) {
+  try {
+    const invites = await guild.invites.fetch();
+    const map = new Map();
+    invites.forEach((inv) => {
+      map.set(inv.code, {
+        uses: inv.uses || 0,
+        maxUses: inv.maxUses || 0,
+        inviterId: inv.inviter ? inv.inviter.id : null,
+        inviterTag: inv.inviter ? inv.inviter.tag : null,
+      });
+    });
+    inviteCache.set(guild.id, map);
+
+    if (guild.features.includes('VANITY_URL')) {
+      try {
+        const vanity = await guild.fetchVanityData();
+        vanityCache.set(guild.id, vanity.uses || 0);
+      } catch (e) {
+        // sem permissão ou sem vanity configurado, ignora
+      }
+    }
+  } catch (err) {
+    console.error(`⚠️ Não consegui cachear convites de "${guild.name}" (verifique se o bot tem permissão "Gerenciar Servidor"):`, err.message);
+  }
+}
 
 // ---------- REGISTRO DO COMANDO /painel-tickets ----------
 const commands = [
@@ -72,6 +163,9 @@ const commands = [
         .setDescription('Texto que vai aparecer na mensagem.')
         .setRequired(true)
     ),
+  new SlashCommandBuilder()
+    .setName('topinvite')
+    .setDescription('Mostra o ranking de quem mais convidou membros para o servidor.'),
 ].map((c) => c.toJSON());
 
 client.once('ready', async () => {
@@ -84,10 +178,39 @@ client.once('ready', async () => {
       Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
       { body: commands }
     );
-    console.log('✅ Comando /painel-tickets registrado.');
+    console.log('✅ Comandos registrados (/painel-tickets, /spoiler, /topinvite).');
   } catch (err) {
     console.error('Erro ao registrar comandos:', err);
   }
+
+  // cacheia os convites de todos os servidores ao iniciar
+  for (const guild of client.guilds.cache.values()) {
+    await cacheGuildInvites(guild);
+  }
+  console.log('✅ Cache de convites carregado.');
+});
+
+// mantém o cache atualizado quando o bot entra em um novo servidor
+client.on('guildCreate', (guild) => {
+  cacheGuildInvites(guild);
+});
+
+// mantém o cache atualizado quando um convite é criado
+client.on('inviteCreate', (invite) => {
+  const map = inviteCache.get(invite.guild.id) || new Map();
+  map.set(invite.code, {
+    uses: invite.uses || 0,
+    maxUses: invite.maxUses || 0,
+    inviterId: invite.inviter ? invite.inviter.id : null,
+    inviterTag: invite.inviter ? invite.inviter.tag : null,
+  });
+  inviteCache.set(invite.guild.id, map);
+});
+
+// mantém o cache atualizado quando um convite é deletado
+client.on('inviteDelete', (invite) => {
+  const map = inviteCache.get(invite.guild.id);
+  if (map) map.delete(invite.code);
 });
 
 function sanitize(name) {
@@ -104,6 +227,115 @@ client.on('messageCreate', (message) => {
 
 client.on('error', (err) => {
   console.error('Erro no cliente do Discord:', err);
+});
+
+// ---------- DETECTA QUEM ENTROU E POR QUAL CONVITE ----------
+client.on('guildMemberAdd', async (member) => {
+  const guild = member.guild;
+
+  let newInvitesCollection = null;
+  try {
+    newInvitesCollection = await guild.invites.fetch();
+  } catch (err) {
+    console.error('⚠️ Não consegui buscar convites (verifique a permissão "Gerenciar Servidor"):', err.message);
+  }
+
+  const oldMap = inviteCache.get(guild.id) || new Map();
+  let used = null;
+
+  if (newInvitesCollection) {
+    // 1) procura um convite cujo número de usos aumentou
+    for (const invite of newInvitesCollection.values()) {
+      const old = oldMap.get(invite.code);
+      if (old && invite.uses > old.uses) {
+        used = {
+          code: invite.code,
+          inviterId: invite.inviter ? invite.inviter.id : null,
+          inviterTag: invite.inviter ? invite.inviter.tag : null,
+        };
+        break;
+      }
+      if (!old && invite.uses > 0) {
+        used = {
+          code: invite.code,
+          inviterId: invite.inviter ? invite.inviter.id : null,
+          inviterTag: invite.inviter ? invite.inviter.tag : null,
+        };
+        break;
+      }
+    }
+
+    // 2) se não achou, pode ser um convite de 1 uso só que já foi deletado automaticamente
+    if (!used) {
+      for (const [code, data] of oldMap.entries()) {
+        if (!newInvitesCollection.has(code) && data.maxUses && data.uses + 1 >= data.maxUses) {
+          used = { code, inviterId: data.inviterId, inviterTag: data.inviterTag };
+          break;
+        }
+      }
+    }
+
+    // atualiza o cache com o estado atual
+    const newMap = new Map();
+    newInvitesCollection.forEach((inv) => {
+      newMap.set(inv.code, {
+        uses: inv.uses || 0,
+        maxUses: inv.maxUses || 0,
+        inviterId: inv.inviter ? inv.inviter.id : null,
+        inviterTag: inv.inviter ? inv.inviter.tag : null,
+      });
+    });
+    inviteCache.set(guild.id, newMap);
+  }
+
+  // 3) checa se foi o link personalizado (vanity URL) do servidor
+  if (!used && guild.vanityURLCode) {
+    try {
+      const vanity = await guild.fetchVanityData();
+      const oldVanityUses = vanityCache.get(guild.id) || 0;
+      if (vanity.uses > oldVanityUses) {
+        used = { code: guild.vanityURLCode, inviterId: null, inviterTag: null, vanity: true };
+      }
+      vanityCache.set(guild.id, vanity.uses || 0);
+    } catch (e) {
+      // ignora se não conseguir checar
+    }
+  }
+
+  // salva no histórico e soma +1 para quem convidou
+  registerInvite(guild.id, used ? used.inviterId : null, member.id, used ? used.code : null);
+
+  // envia o aviso no canal configurado
+  const logChannel = guild.channels.cache.get(INVITE_LOG_CHANNEL_ID);
+  if (!logChannel) return;
+
+  const gData = ensureGuildData(guild.id);
+  const totalInvites = used && used.inviterId ? gData.counts[used.inviterId] || 0 : 0;
+
+  let inviterText;
+  if (used && used.vanity) {
+    inviterText = '🔗 Entrou pelo link personalizado do servidor (vanity URL)';
+  } else if (used && used.inviterId) {
+    inviterText = `<@${used.inviterId}> — já convidou **${totalInvites}** membro(s) no total`;
+  } else {
+    inviterText = '❓ Não foi possível identificar (convite expirado, integração OAuth, ou outro bot)';
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(0x2ecc71)
+    .setTitle('📥 Novo membro entrou!')
+    .setDescription(
+      `👤 **Membro:** ${member}\n` +
+      `🔑 **Convite usado:** ${used && used.code ? `\`${used.code}\`` : 'Desconhecido'}\n` +
+      `🙋 **Convidado por:** ${inviterText}`
+    )
+    .setThumbnail(member.user.displayAvatarURL())
+    .setFooter({ text: `ID: ${member.id}` })
+    .setTimestamp();
+
+  logChannel.send({ embeds: [embed] }).catch((err) => {
+    console.error('Erro ao enviar log de convite:', err.message);
+  });
 });
 
 // ---------- INTERAÇÕES (slash command + botões) ----------
@@ -161,6 +393,37 @@ client.on('interactionCreate', async (interaction) => {
 
     await interaction.channel.send({ embeds: [spoilerEmbed] });
     await interaction.reply({ content: '✅ Mensagem enviada!', ephemeral: true });
+    return;
+  }
+
+  // ---------- COMANDO: /topinvite ----------
+  if (interaction.isChatInputCommand() && interaction.commandName === 'topinvite') {
+    const gData = ensureGuildData(interaction.guild.id);
+    const sorted = Object.entries(gData.counts)
+      .filter(([, count]) => count > 0)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 3);
+
+    if (sorted.length === 0) {
+      return interaction.reply({
+        content: '📭 Ainda não há nenhum registro de convites neste servidor.',
+        ephemeral: true,
+      });
+    }
+
+    const medals = ['🥇', '🥈', '🥉'];
+    const lines = sorted.map(([userId, count], i) => {
+      return `${medals[i]} <@${userId}> — **${count}** convite(s)`;
+    });
+
+    const embed = new EmbedBuilder()
+      .setColor(0xf1c40f)
+      .setTitle('🏆 Top Convites do Servidor')
+      .setDescription(lines.join('\n'))
+      .setFooter({ text: `Solicitado por ${interaction.user.tag}` })
+      .setTimestamp();
+
+    await interaction.reply({ embeds: [embed] });
     return;
   }
 
