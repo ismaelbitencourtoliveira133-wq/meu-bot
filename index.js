@@ -20,6 +20,11 @@ const express = require('express');
 // ---------- CANAL DE LOG DE CONVITES ----------
 const INVITE_LOG_CHANNEL_ID = '1518234479494299779';
 
+// ---------- CONFIGURAÇÃO DO SISTEMA DE TICKETS ----------
+const TICKET_PANEL_CHANNEL_ID = '1518234573203312700'; // canal onde fica a mensagem/painel para abrir ticket
+const CATEGORY_ID = '1518361267071615148'; // categoria onde os canais de ticket serão criados
+const STAFF_ROLE_ID = '1518234150627315762'; // cargo que será marcado e que tem acesso aos tickets
+
 // ---------- CONFIGURAÇÃO DOS TIPOS DE TICKET ----------
 const TICKET_TYPES = {
   suporte: {
@@ -369,8 +374,16 @@ client.on('interactionCreate', async (interaction) => {
       )
     );
 
-    await interaction.channel.send({ embeds: [embed], components: [row] });
-    await interaction.reply({ content: '✅ Painel enviado!', ephemeral: true });
+    const panelChannel = interaction.guild.channels.cache.get(TICKET_PANEL_CHANNEL_ID);
+    if (!panelChannel) {
+      return interaction.reply({
+        content: '❌ Não encontrei o canal configurado para o painel de tickets. Verifique o ID configurado.',
+        ephemeral: true,
+      });
+    }
+
+    await panelChannel.send({ embeds: [embed], components: [row] });
+    await interaction.reply({ content: `✅ Painel enviado em ${panelChannel}!`, ephemeral: true });
     return;
   }
 
@@ -466,9 +479,9 @@ client.on('interactionCreate', async (interaction) => {
       },
     ];
 
-    if (process.env.STAFF_ROLE_ID) {
+    if (STAFF_ROLE_ID) {
       permissionOverwrites.push({
-        id: process.env.STAFF_ROLE_ID,
+        id: STAFF_ROLE_ID,
         allow: [
           PermissionFlagsBits.ViewChannel,
           PermissionFlagsBits.SendMessages,
@@ -480,7 +493,7 @@ client.on('interactionCreate', async (interaction) => {
     const channel = await guild.channels.create({
       name: channelName,
       type: ChannelType.GuildText,
-      parent: process.env.CATEGORY_ID || null,
+      parent: CATEGORY_ID || null,
       permissionOverwrites,
     });
 
@@ -511,7 +524,7 @@ client.on('interactionCreate', async (interaction) => {
         .setStyle(ButtonStyle.Danger)
     );
 
-    const staffMention = process.env.STAFF_ROLE_ID ? `<@&${process.env.STAFF_ROLE_ID}>` : '';
+    const staffMention = STAFF_ROLE_ID ? `<@&${STAFF_ROLE_ID}>` : '';
 
     await channel.send({
       content: `${interaction.user} ${staffMention}`,
@@ -527,8 +540,8 @@ client.on('interactionCreate', async (interaction) => {
 
   // ---------- BOTÃO: FECHAR TICKET ----------
   if (interaction.isButton() && interaction.customId === 'close_ticket') {
-    const isStaff = process.env.STAFF_ROLE_ID
-      ? interaction.member.roles.cache.has(process.env.STAFF_ROLE_ID)
+    const isStaff = STAFF_ROLE_ID
+      ? interaction.member.roles.cache.has(STAFF_ROLE_ID)
       : false;
     const isOwner = interaction.channel.permissionOverwrites.cache.has(interaction.user.id);
 
