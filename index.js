@@ -17,6 +17,16 @@ const {
 } = require('discord.js');
 const express = require('express');
 
+// ---------- PROTEÇÃO GLOBAL CONTRA CRASH ----------
+// Sem isso, qualquer erro não tratado em uma Promise derruba o processo inteiro
+// (comportamento padrão do Node desde a v15+), o que mataria o bot todo, não só os tickets.
+process.on('unhandledRejection', (reason) => {
+  console.error('⚠️ Unhandled Rejection (não derrubou o bot, só logando):', reason);
+});
+process.on('uncaughtException', (err) => {
+  console.error('⚠️ Uncaught Exception (não derrubou o bot, só logando):', err);
+});
+
 // ---------- CANAL DE LOG DE CONVITES ----------
 const INVITE_LOG_CHANNEL_ID = '1518234479494299779';
 
@@ -223,6 +233,31 @@ function sanitize(name) {
   return name.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 20) || 'user';
 }
 
+// helper: corre uma Promise contra um limite de tempo. Se a Promise demorar
+// demais (API do Discord lenta, rate limit, etc.), rejeita em vez de travar
+// a interação pra sempre no estado "pensando...".
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Timeout (${ms}ms) em: ${label}`)), ms)
+    ),
+  ]);
+}
+
+// helper: responde com segurança a uma interação, não importa em que estado ela esteja
+async function safeRespond(interaction, payload) {
+  try {
+    if (interaction.deferred || interaction.replied) {
+      await withTimeout(interaction.editReply(payload), 5000, 'editReply');
+    } else {
+      await withTimeout(interaction.reply({ ...payload, ephemeral: true }), 5000, 'reply');
+    }
+  } catch (err) {
+    console.error('Erro ao responder interação com segurança:', err.message);
+  }
+}
+
 // ---------- COMANDO !ping ----------
 client.on('messageCreate', (message) => {
   if (message.author.bot) return;
@@ -237,344 +272,412 @@ client.on('error', (err) => {
 
 // ---------- DETECTA QUEM ENTROU E POR QUAL CONVITE ----------
 client.on('guildMemberAdd', async (member) => {
-  const guild = member.guild;
-
-  let newInvitesCollection = null;
   try {
-    newInvitesCollection = await guild.invites.fetch();
-  } catch (err) {
-    console.error('⚠️ Não consegui buscar convites (verifique a permissão "Gerenciar Servidor"):', err.message);
-  }
+    const guild = member.guild;
 
-  const oldMap = inviteCache.get(guild.id) || new Map();
-  let used = null;
-
-  if (newInvitesCollection) {
-    // 1) procura um convite cujo número de usos aumentou
-    for (const invite of newInvitesCollection.values()) {
-      const old = oldMap.get(invite.code);
-      if (old && invite.uses > old.uses) {
-        used = {
-          code: invite.code,
-          inviterId: invite.inviter ? invite.inviter.id : null,
-          inviterTag: invite.inviter ? invite.inviter.tag : null,
-        };
-        break;
-      }
-      if (!old && invite.uses > 0) {
-        used = {
-          code: invite.code,
-          inviterId: invite.inviter ? invite.inviter.id : null,
-          inviterTag: invite.inviter ? invite.inviter.tag : null,
-        };
-        break;
-      }
+    let newInvitesCollection = null;
+    try {
+      newInvitesCollection = await guild.invites.fetch();
+    } catch (err) {
+      console.error('⚠️ Não consegui buscar convites (verifique a permissão "Gerenciar Servidor"):', err.message);
     }
 
-    // 2) se não achou, pode ser um convite de 1 uso só que já foi deletado automaticamente
-    if (!used) {
-      for (const [code, data] of oldMap.entries()) {
-        if (!newInvitesCollection.has(code) && data.maxUses && data.uses + 1 >= data.maxUses) {
-          used = { code, inviterId: data.inviterId, inviterTag: data.inviterTag };
+    const oldMap = inviteCache.get(guild.id) || new Map();
+    let used = null;
+
+    if (newInvitesCollection) {
+      // 1) procura um convite cujo número de usos aumentou
+      for (const invite of newInvitesCollection.values()) {
+        const old = oldMap.get(invite.code);
+        if (old && invite.uses > old.uses) {
+          used = {
+            code: invite.code,
+            inviterId: invite.inviter ? invite.inviter.id : null,
+            inviterTag: invite.inviter ? invite.inviter.tag : null,
+          };
+          break;
+        }
+        if (!old && invite.uses > 0) {
+          used = {
+            code: invite.code,
+            inviterId: invite.inviter ? invite.inviter.id : null,
+            inviterTag: invite.inviter ? invite.inviter.tag : null,
+          };
           break;
         }
       }
-    }
 
-    // atualiza o cache com o estado atual
-    const newMap = new Map();
-    newInvitesCollection.forEach((inv) => {
-      newMap.set(inv.code, {
-        uses: inv.uses || 0,
-        maxUses: inv.maxUses || 0,
-        inviterId: inv.inviter ? inv.inviter.id : null,
-        inviterTag: inv.inviter ? inv.inviter.tag : null,
-      });
-    });
-    inviteCache.set(guild.id, newMap);
-  }
-
-  // 3) checa se foi o link personalizado (vanity URL) do servidor
-  if (!used && guild.vanityURLCode) {
-    try {
-      const vanity = await guild.fetchVanityData();
-      const oldVanityUses = vanityCache.get(guild.id) || 0;
-      if (vanity.uses > oldVanityUses) {
-        used = { code: guild.vanityURLCode, inviterId: null, inviterTag: null, vanity: true };
+      // 2) se não achou, pode ser um convite de 1 uso só que já foi deletado automaticamente
+      if (!used) {
+        for (const [code, data] of oldMap.entries()) {
+          if (!newInvitesCollection.has(code) && data.maxUses && data.uses + 1 >= data.maxUses) {
+            used = { code, inviterId: data.inviterId, inviterTag: data.inviterTag };
+            break;
+          }
+        }
       }
-      vanityCache.set(guild.id, vanity.uses || 0);
-    } catch (e) {
-      // ignora se não conseguir checar
+
+      // atualiza o cache com o estado atual
+      const newMap = new Map();
+      newInvitesCollection.forEach((inv) => {
+        newMap.set(inv.code, {
+          uses: inv.uses || 0,
+          maxUses: inv.maxUses || 0,
+          inviterId: inv.inviter ? inv.inviter.id : null,
+          inviterTag: inv.inviter ? inv.inviter.tag : null,
+        });
+      });
+      inviteCache.set(guild.id, newMap);
     }
+
+    // 3) checa se foi o link personalizado (vanity URL) do servidor
+    if (!used && guild.vanityURLCode) {
+      try {
+        const vanity = await guild.fetchVanityData();
+        const oldVanityUses = vanityCache.get(guild.id) || 0;
+        if (vanity.uses > oldVanityUses) {
+          used = { code: guild.vanityURLCode, inviterId: null, inviterTag: null, vanity: true };
+        }
+        vanityCache.set(guild.id, vanity.uses || 0);
+      } catch (e) {
+        // ignora se não conseguir checar
+      }
+    }
+
+    // salva no histórico e soma +1 para quem convidou
+    registerInvite(guild.id, used ? used.inviterId : null, member.id, used ? used.code : null);
+
+    // envia o aviso no canal configurado
+    const logChannel = guild.channels.cache.get(INVITE_LOG_CHANNEL_ID);
+    if (!logChannel) return;
+
+    const gData = ensureGuildData(guild.id);
+    const totalInvites = used && used.inviterId ? gData.counts[used.inviterId] || 0 : 0;
+
+    let inviterText;
+    if (used && used.vanity) {
+      inviterText = '🔗 Entrou pelo link personalizado do servidor (vanity URL)';
+    } else if (used && used.inviterId) {
+      inviterText = `<@${used.inviterId}> — já convidou **${totalInvites}** membro(s) no total`;
+    } else {
+      inviterText = '❓ Não foi possível identificar (convite expirado, integração OAuth, ou outro bot)';
+    }
+
+    const embed = new EmbedBuilder()
+      .setColor(0x2ecc71)
+      .setTitle('📥 Novo membro entrou!')
+      .setDescription(
+        `👤 **Membro:** ${member}\n` +
+        `🔑 **Convite usado:** ${used && used.code ? `\`${used.code}\`` : 'Desconhecido'}\n` +
+        `🙋 **Convidado por:** ${inviterText}`
+      )
+      .setThumbnail(member.user.displayAvatarURL())
+      .setFooter({ text: `ID: ${member.id}` })
+      .setTimestamp();
+
+    logChannel.send({ embeds: [embed] }).catch((err) => {
+      console.error('Erro ao enviar log de convite:', err.message);
+    });
+  } catch (err) {
+    console.error('⚠️ Erro inesperado em guildMemberAdd:', err);
   }
-
-  // salva no histórico e soma +1 para quem convidou
-  registerInvite(guild.id, used ? used.inviterId : null, member.id, used ? used.code : null);
-
-  // envia o aviso no canal configurado
-  const logChannel = guild.channels.cache.get(INVITE_LOG_CHANNEL_ID);
-  if (!logChannel) return;
-
-  const gData = ensureGuildData(guild.id);
-  const totalInvites = used && used.inviterId ? gData.counts[used.inviterId] || 0 : 0;
-
-  let inviterText;
-  if (used && used.vanity) {
-    inviterText = '🔗 Entrou pelo link personalizado do servidor (vanity URL)';
-  } else if (used && used.inviterId) {
-    inviterText = `<@${used.inviterId}> — já convidou **${totalInvites}** membro(s) no total`;
-  } else {
-    inviterText = '❓ Não foi possível identificar (convite expirado, integração OAuth, ou outro bot)';
-  }
-
-  const embed = new EmbedBuilder()
-    .setColor(0x2ecc71)
-    .setTitle('📥 Novo membro entrou!')
-    .setDescription(
-      `👤 **Membro:** ${member}\n` +
-      `🔑 **Convite usado:** ${used && used.code ? `\`${used.code}\`` : 'Desconhecido'}\n` +
-      `🙋 **Convidado por:** ${inviterText}`
-    )
-    .setThumbnail(member.user.displayAvatarURL())
-    .setFooter({ text: `ID: ${member.id}` })
-    .setTimestamp();
-
-  logChannel.send({ embeds: [embed] }).catch((err) => {
-    console.error('Erro ao enviar log de convite:', err.message);
-  });
 });
 
 // ---------- INTERAÇÕES (slash command + botões) ----------
 client.on('interactionCreate', async (interaction) => {
-  // ---------- COMANDO: ENVIAR PAINEL ----------
-  if (interaction.isChatInputCommand() && interaction.commandName === 'painel-tickets') {
-    const embed = new EmbedBuilder()
-      .setColor(0xf1c40f)
-      .setTitle('🎟️  Central de Atendimento')
-      .setDescription(
-        '**Precisa falar com a gente? Você está no lugar certo!**\n' +
-        'Escolha abaixo o motivo do seu ticket e nossa equipe vai te atender o mais rápido possível.\n' +
-        '➖➖➖➖➖➖➖➖➖➖➖➖➖➖➖➖➖'
-      )
-      .addFields(
-        Object.values(TICKET_TYPES).map((t) => ({
-          name: `${t.emoji}  ${t.label}`,
-          value: t.description,
-        }))
-      )
-      .setFooter({ text: 'Selecione uma opção abaixo 👇' })
-      .setTimestamp();
+  try {
+    // ---------- COMANDO: ENVIAR PAINEL ----------
+    if (interaction.isChatInputCommand() && interaction.commandName === 'painel-tickets') {
+      const embed = new EmbedBuilder()
+        .setColor(0xf1c40f)
+        .setTitle('🎟️  Central de Atendimento')
+        .setDescription(
+          '**Precisa falar com a gente? Você está no lugar certo!**\n' +
+          'Escolha abaixo o motivo do seu ticket e nossa equipe vai te atender o mais rápido possível.\n' +
+          '➖➖➖➖➖➖➖➖➖➖➖➖➖➖➖➖➖'
+        )
+        .addFields(
+          Object.values(TICKET_TYPES).map((t) => ({
+            name: `${t.emoji}  ${t.label}`,
+            value: t.description,
+          }))
+        )
+        .setFooter({ text: 'Selecione uma opção abaixo 👇' })
+        .setTimestamp();
 
-    const row = new ActionRowBuilder().addComponents(
-      Object.entries(TICKET_TYPES).map(([key, t]) =>
-        new ButtonBuilder()
-          .setCustomId(`open_ticket_${key}`)
-          .setLabel(t.label)
-          .setEmoji(t.emoji)
-          .setStyle(t.style)
-      )
-    );
+      const row = new ActionRowBuilder().addComponents(
+        Object.entries(TICKET_TYPES).map(([key, t]) =>
+          new ButtonBuilder()
+            .setCustomId(`open_ticket_${key}`)
+            .setLabel(t.label)
+            .setEmoji(t.emoji)
+            .setStyle(t.style)
+        )
+      );
 
-    const panelChannel = interaction.guild.channels.cache.get(TICKET_PANEL_CHANNEL_ID);
-    if (!panelChannel) {
-      return interaction.reply({
-        content: '❌ Não encontrei o canal configurado para o painel de tickets. Verifique o ID configurado.',
-        ephemeral: true,
-      });
+      const panelChannel = interaction.guild.channels.cache.get(TICKET_PANEL_CHANNEL_ID);
+      if (!panelChannel) {
+        return interaction.reply({
+          content: '❌ Não encontrei o canal configurado para o painel de tickets. Verifique o ID configurado.',
+          ephemeral: true,
+        });
+      }
+
+      await panelChannel.send({ embeds: [embed], components: [row] });
+      await interaction.reply({ content: `✅ Painel enviado em ${panelChannel}!`, ephemeral: true });
+      return;
     }
 
-    await panelChannel.send({ embeds: [embed], components: [row] });
-    await interaction.reply({ content: `✅ Painel enviado em ${panelChannel}!`, ephemeral: true });
-    return;
-  }
+    // ---------- COMANDO: /spoiler ----------
+    if (interaction.isChatInputCommand() && interaction.commandName === 'spoiler') {
+      if (!interaction.member.roles.cache.has(SPOILER_ROLE_ID)) {
+        return interaction.reply({
+          content: '❌ Você não tem permissão para usar este comando.',
+          ephemeral: true,
+        });
+      }
 
-  // ---------- COMANDO: /spoiler ----------
-  if (interaction.isChatInputCommand() && interaction.commandName === 'spoiler') {
-    if (!interaction.member.roles.cache.has(SPOILER_ROLE_ID)) {
-      return interaction.reply({
-        content: '❌ Você não tem permissão para usar este comando.',
-        ephemeral: true,
-      });
+      const texto = interaction.options.getString('mensagem', true);
+
+      const spoilerEmbed = new EmbedBuilder()
+        .setColor(0x2c2f33)
+        .setDescription(`||${texto}||`)
+        .setFooter({ text: '👁️ Clique para revelar' })
+        .setTimestamp();
+
+      await interaction.channel.send({ embeds: [spoilerEmbed] });
+      await interaction.reply({ content: '✅ Mensagem enviada!', ephemeral: true });
+      return;
     }
 
-    const texto = interaction.options.getString('mensagem', true);
+    // ---------- COMANDO: /topinvite ----------
+    if (interaction.isChatInputCommand() && interaction.commandName === 'topinvite') {
+      const gData = ensureGuildData(interaction.guild.id);
+      const sorted = Object.entries(gData.counts)
+        .filter(([, count]) => count > 0)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 3);
 
-    const spoilerEmbed = new EmbedBuilder()
-      .setColor(0x2c2f33)
-      .setDescription(`||${texto}||`)
-      .setFooter({ text: '👁️ Clique para revelar' })
-      .setTimestamp();
+      if (sorted.length === 0) {
+        return interaction.reply({
+          content: '📭 Ainda não há nenhum registro de convites neste servidor.',
+          ephemeral: true,
+        });
+      }
 
-    await interaction.channel.send({ embeds: [spoilerEmbed] });
-    await interaction.reply({ content: '✅ Mensagem enviada!', ephemeral: true });
-    return;
-  }
-
-  // ---------- COMANDO: /topinvite ----------
-  if (interaction.isChatInputCommand() && interaction.commandName === 'topinvite') {
-    const gData = ensureGuildData(interaction.guild.id);
-    const sorted = Object.entries(gData.counts)
-      .filter(([, count]) => count > 0)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 3);
-
-    if (sorted.length === 0) {
-      return interaction.reply({
-        content: '📭 Ainda não há nenhum registro de convites neste servidor.',
-        ephemeral: true,
+      const medals = ['🥇', '🥈', '🥉'];
+      const lines = sorted.map(([userId, count], i) => {
+        return `${medals[i]} <@${userId}> — **${count}** convite(s)`;
       });
+
+      const embed = new EmbedBuilder()
+        .setColor(0xf1c40f)
+        .setTitle('🏆 Top Convites do Servidor')
+        .setDescription(lines.join('\n'))
+        .setFooter({ text: `Solicitado por ${interaction.user.tag}` })
+        .setTimestamp();
+
+      await interaction.reply({ embeds: [embed] });
+      return;
     }
 
-    const medals = ['🥇', '🥈', '🥉'];
-    const lines = sorted.map(([userId, count], i) => {
-      return `${medals[i]} <@${userId}> — **${count}** convite(s)`;
-    });
+    // ---------- BOTÃO: ABRIR TICKET ----------
+    if (interaction.isButton() && interaction.customId.startsWith('open_ticket_')) {
+      const typeKey = interaction.customId.replace('open_ticket_', '');
+      const type = TICKET_TYPES[typeKey];
+      if (!type) return;
 
-    const embed = new EmbedBuilder()
-      .setColor(0xf1c40f)
-      .setTitle('🏆 Top Convites do Servidor')
-      .setDescription(lines.join('\n'))
-      .setFooter({ text: `Solicitado por ${interaction.user.tag}` })
-      .setTimestamp();
+      try {
+        await withTimeout(interaction.deferReply({ ephemeral: true }), 4000, 'deferReply');
+      } catch (err) {
+        console.error('⚠️ deferReply travou/demorou demais:', err.message);
+        return; // se nem o defer respondeu, não há mais nada seguro a fazer
+      }
 
-    await interaction.reply({ embeds: [embed] });
-    return;
-  }
+      const guild = interaction.guild;
+      const userTag = sanitize(interaction.user.username);
+      const channelName = `${typeKey}-${userTag}`;
 
-  // ---------- BOTÃO: ABRIR TICKET ----------
-  if (interaction.isButton() && interaction.customId.startsWith('open_ticket_')) {
-    const typeKey = interaction.customId.replace('open_ticket_', '');
-    const type = TICKET_TYPES[typeKey];
-    if (!type) return;
+      const existing = guild.channels.cache.find((c) => c.name === channelName);
+      if (existing) {
+        return safeRespond(interaction, {
+          content: `❌ Você já tem um ticket de **${type.label}** aberto: ${existing}`,
+        });
+      }
 
-    await interaction.deferReply({ ephemeral: true });
+      const permissionOverwrites = [
+        { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
+        {
+          id: interaction.user.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
+          ],
+        },
+        {
+          id: client.user.id,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ManageChannels,
+          ],
+        },
+      ];
 
-    const guild = interaction.guild;
-    const userTag = sanitize(interaction.user.username);
-    const channelName = `${typeKey}-${userTag}`;
-
-    const existing = guild.channels.cache.find((c) => c.name === channelName);
-    if (existing) {
-      return interaction.editReply({
-        content: `❌ Você já tem um ticket de **${type.label}** aberto: ${existing}`,
-      });
-    }
-
-    const permissionOverwrites = [
-      { id: guild.roles.everyone.id, deny: [PermissionFlagsBits.ViewChannel] },
-      {
-        id: interaction.user.id,
-        allow: [
-          PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.ReadMessageHistory,
-        ],
-      },
-      {
-        id: client.user.id,
-        allow: [
-          PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.ManageChannels,
-        ],
-      },
-    ];
-
-    if (STAFF_ROLE_ID) {
-      permissionOverwrites.push({
-        id: STAFF_ROLE_ID,
-        allow: [
-          PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.ReadMessageHistory,
-        ],
-      });
-    }
-
-    const channel = await guild.channels.create({
-      name: channelName,
-      type: ChannelType.GuildText,
-      parent: CATEGORY_ID || null,
-      permissionOverwrites,
-    });
-
-    const welcomeEmbed = new EmbedBuilder()
-      .setColor(type.color)
-      .setTitle(`${type.emoji}  Ticket de ${type.label}`)
-      .setDescription(
-        `**Olá, ${interaction.user}! 👋**\n` +
-        `Seja bem-vindo ao seu ticket de **${type.label}**.\n` +
-        `Nossa equipe foi notificada e vai te atender em breve.\n` +
-        '➖➖➖➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n' +
-        `**Enquanto isso:**\n` +
-        `> 📝 Descreva seu motivo com o máximo de detalhes possível.\n` +
-        `> ⏳ Tenha paciência, vamos te responder assim que possível!`
-      )
-      .addFields(
-        { name: '📂 Categoria', value: type.label, inline: true },
-        { name: '👤 Aberto por', value: `${interaction.user}`, inline: true }
-      )
-      .setFooter({ text: 'Use o botão abaixo para fechar quando finalizar 🔒' })
-      .setTimestamp();
-
-    const closeRow = new ActionRowBuilder().addComponents(
-      new ButtonBuilder()
-        .setCustomId('close_ticket')
-        .setLabel('Fechar Ticket')
-        .setEmoji('🔒')
-        .setStyle(ButtonStyle.Danger)
-    );
-
-    const staffMention = STAFF_ROLE_ID ? `<@&${STAFF_ROLE_ID}>` : '';
-
-    await channel.send({
-      content: `${interaction.user} ${staffMention}`,
-      embeds: [welcomeEmbed],
-      components: [closeRow],
-    });
-
-    await interaction.editReply({
-      content: `✅ Ticket criado: ${channel}`,
-    });
-    return;
-  }
-
-  // ---------- BOTÃO: FECHAR TICKET ----------
-  if (interaction.isButton() && interaction.customId === 'close_ticket') {
-    const isStaff = STAFF_ROLE_ID
-      ? interaction.member.roles.cache.has(STAFF_ROLE_ID)
-      : false;
-    const isOwner = interaction.channel.permissionOverwrites.cache.has(interaction.user.id);
-
-    if (!isStaff && !isOwner) {
-      return interaction.reply({
-        content: '❌ Você não tem permissão para fechar este ticket.',
-        ephemeral: true,
-      });
-    }
-
-    await interaction.reply('🔒 Fechando este ticket em 5 segundos...');
-
-    if (process.env.LOG_CHANNEL_ID) {
-      const logChannel = interaction.guild.channels.cache.get(process.env.LOG_CHANNEL_ID);
-      if (logChannel) {
-        logChannel.send({
-          embeds: [
-            new EmbedBuilder()
-              .setTitle('🔒 Ticket fechado')
-              .setDescription(`Canal: **${interaction.channel.name}**`)
-              .addFields({ name: 'Fechado por', value: `${interaction.user.tag}` })
-              .setColor(0x99aab5)
-              .setTimestamp(),
+      if (STAFF_ROLE_ID) {
+        permissionOverwrites.push({
+          id: STAFF_ROLE_ID,
+          allow: [
+            PermissionFlagsBits.ViewChannel,
+            PermissionFlagsBits.SendMessages,
+            PermissionFlagsBits.ReadMessageHistory,
           ],
         });
       }
+
+      // Tenta criar o canal dentro da categoria configurada. Se a categoria estiver
+      // cheia (limite de 50 canais do Discord), inacessível, ou for inválida, cai
+      // para criar o canal sem categoria em vez de simplesmente falhar.
+      let channel;
+      try {
+        channel = await withTimeout(
+          guild.channels.create({
+            name: channelName,
+            type: ChannelType.GuildText,
+            parent: CATEGORY_ID || null,
+            permissionOverwrites,
+          }),
+          8000,
+          'criar canal (categoria)'
+        );
+      } catch (err) {
+        console.error('⚠️ Falha ao criar canal de ticket na categoria configurada:', err.message);
+        try {
+          channel = await withTimeout(
+            guild.channels.create({
+              name: channelName,
+              type: ChannelType.GuildText,
+              permissionOverwrites,
+            }),
+            8000,
+            'criar canal (sem categoria)'
+          );
+          console.log('✅ Canal de ticket criado sem categoria (fallback).');
+        } catch (err2) {
+          console.error('❌ Falha total ao criar canal de ticket:', err2.message);
+          return safeRespond(interaction, {
+            content: '❌ Não consegui criar seu ticket agora (demorou demais ou a categoria está cheia/sem permissão). Tente de novo em alguns segundos ou avise a staff.',
+          });
+        }
+      }
+
+      const welcomeEmbed = new EmbedBuilder()
+        .setColor(type.color)
+        .setTitle(`${type.emoji}  Ticket de ${type.label}`)
+        .setDescription(
+          `**Olá, ${interaction.user}! 👋**\n` +
+          `Seja bem-vindo ao seu ticket de **${type.label}**.\n` +
+          `Nossa equipe foi notificada e vai te atender em breve.\n` +
+          '➖➖➖➖➖➖➖➖➖➖➖➖➖➖➖➖➖\n' +
+          `**Enquanto isso:**\n` +
+          `> 📝 Descreva seu motivo com o máximo de detalhes possível.\n` +
+          `> ⏳ Tenha paciência, vamos te responder assim que possível!`
+        )
+        .addFields(
+          { name: '📂 Categoria', value: type.label, inline: true },
+          { name: '👤 Aberto por', value: `${interaction.user}`, inline: true }
+        )
+        .setFooter({ text: 'Use o botão abaixo para fechar quando finalizar 🔒' })
+        .setTimestamp();
+
+      const closeRow = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId('close_ticket')
+          .setLabel('Fechar Ticket')
+          .setEmoji('🔒')
+          .setStyle(ButtonStyle.Danger)
+      );
+
+      const staffMention = STAFF_ROLE_ID ? `<@&${STAFF_ROLE_ID}>` : '';
+
+      try {
+        await withTimeout(
+          channel.send({
+            content: `${interaction.user} ${staffMention}`,
+            embeds: [welcomeEmbed],
+            components: [closeRow],
+          }),
+          6000,
+          'enviar mensagem de boas-vindas'
+        );
+      } catch (err) {
+        console.error('⚠️ Canal de ticket criado, mas falhou ao enviar a mensagem de boas-vindas:', err.message);
+      }
+
+      await safeRespond(interaction, {
+        content: `✅ Ticket criado: ${channel}`,
+      });
+      return;
     }
 
-    setTimeout(() => {
-      interaction.channel.delete().catch(() => {});
-    }, 5000);
-    return;
+    // ---------- BOTÃO: FECHAR TICKET ----------
+    if (interaction.isButton() && interaction.customId === 'close_ticket') {
+      const isStaff = STAFF_ROLE_ID && interaction.member
+        ? interaction.member.roles.cache.has(STAFF_ROLE_ID)
+        : false;
+      const isOwner = interaction.channel.permissionOverwrites.cache.has(interaction.user.id);
+
+      if (!isStaff && !isOwner) {
+        return interaction.reply({
+          content: '❌ Você não tem permissão para fechar este ticket.',
+          ephemeral: true,
+        });
+      }
+
+      await interaction.reply('🔒 Fechando este ticket em 5 segundos...');
+
+      if (process.env.LOG_CHANNEL_ID) {
+        const logChannel = interaction.guild.channels.cache.get(process.env.LOG_CHANNEL_ID);
+        if (logChannel) {
+          logChannel.send({
+            embeds: [
+              new EmbedBuilder()
+                .setTitle('🔒 Ticket fechado')
+                .setDescription(`Canal: **${interaction.channel.name}**`)
+                .addFields({ name: 'Fechado por', value: `${interaction.user.tag}` })
+                .setColor(0x99aab5)
+                .setTimestamp(),
+            ],
+          }).catch((err) => console.error('Erro ao enviar log de fechamento:', err.message));
+        }
+      }
+
+      setTimeout(() => {
+        interaction.channel.delete().catch((err) => {
+          console.error('⚠️ Falha ao deletar canal de ticket:', err.message);
+        });
+      }, 5000);
+      return;
+    }
+  } catch (err) {
+    // Rede de segurança final: qualquer erro não previsto acima cai aqui,
+    // garantindo que o usuário recebe uma resposta e o bot não trava.
+    console.error('❌ Erro inesperado em interactionCreate:', err);
+    try {
+      if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
+        await interaction.reply({
+          content: '❌ Ocorreu um erro inesperado. Tente novamente ou avise a staff.',
+          ephemeral: true,
+        });
+      } else if (interaction.isRepliable() && (interaction.deferred || interaction.replied)) {
+        await interaction.editReply({
+          content: '❌ Ocorreu um erro inesperado. Tente novamente ou avise a staff.',
+        });
+      }
+    } catch (e) {
+      console.error('Falha até ao tentar avisar o usuário do erro:', e.message);
+    }
   }
 });
 
